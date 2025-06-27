@@ -1,3 +1,4 @@
+import re
 from typing import Dict, List
 
 import avro.schema
@@ -67,7 +68,14 @@ def import_avro(data_contract_specification: DataContractSpecification, source: 
         data_contract_specification.models[avro_schema.name].description = avro_schema.get_prop("doc")
 
     if avro_schema.get_prop("namespace") is not None:
-        data_contract_specification.models[avro_schema.name].namespace = avro_schema.get_prop("namespace")
+        if data_contract_specification.models[avro_schema.name].config is None:
+            data_contract_specification.models[avro_schema.name].config = {}
+        data_contract_specification.models[avro_schema.name].config["avroType"] = avro_schema.name
+        data_contract_specification.models[avro_schema.name].config["avroNamespace"] = avro_schema.get_prop("namespace")
+
+    if avro_schema.get_prop("type") is not None:
+        if avro_schema.get_prop("type") == "record":
+            data_contract_specification.models[avro_schema.name].type = "object"
 
     return data_contract_specification
 
@@ -123,23 +131,93 @@ def import_record_fields(record_fields: List[avro.schema.Field]) -> Dict[str, Fi
 
         handle_config_avro_custom_properties(field, imported_field)
 
+        if field.get_prop("tags") is not None:
+            imported_field.tags = field.get_prop("tags")
+
+        if field.get_prop("x-lineage") is not None:
+            imported_field.lineage = {"inputFields": []}
+            for entry in field.get_prop("x-lineage"):
+                matches = re.findall(r"\[(.*?)\]", entry)
+                if len(matches) == 2:
+                    namespace = matches[0]
+                    name = matches[0]
+                    fieldName = matches[1]
+                    imported_field.lineage["inputFields"].append(
+                        {"namespace": namespace, "name": name, "field": fieldName}
+                    )
+
+        if field.get_prop("x-glossary") is not None:
+            imported_field.relatedTerms = field.get_prop("x-glossary")
+
         # Determine field type and handle nested structures
         if field.type.type == "record":
-            imported_field.type = "object"
-            imported_field.description = field.type.doc
+            imported_field.type = "record"
+            imported_field.description = field.doc
             imported_field.fields = import_record_fields(field.type.fields)
+
+            if not imported_field.config:
+                imported_field.config = {}
+            imported_field.config["avroType"] = field.type.name
+
+            if not imported_field.config:
+                imported_field.config = {}
+            imported_field.config["avroNamespace"] = field.type.namespace
+
         elif field.type.type == "union":
             imported_field.required = False
             type = import_type_of_optional_field(field)
             imported_field.type = type
             if type == "record":
                 imported_field.fields = import_record_fields(get_record_from_union_field(field).fields)
+
+                imported_field.description = field.doc
+
+                if not imported_field.config:
+                    imported_field.config = {}
+                imported_field.config["avroType"] = field.type.schemas[1].name
+
+                if not imported_field.config:
+                    imported_field.config = {}
+                imported_field.config["avroNamespace"] = field.type.schemas[1].namespace
+
             elif type == "array":
                 imported_field.type = "array"
                 imported_field.items = import_avro_array_items(get_array_from_union_field(field))
+
+                imported_field.description = field.doc
+
+                if not isinstance(field.type.schemas[1].items, avro.schema.PrimitiveSchema):
+                    if not imported_field.items.config:
+                        imported_field.items.config = {}
+                    imported_field.items.config["avroType"] = field.type.schemas[1].items.name
+
+                    if not imported_field.items.config:
+                        imported_field.items.config = {}
+                    imported_field.items.config["avroNamespace"] = field.type.schemas[1].items.namespace
+
+            elif type == "enum":
+                imported_field.type = "string"
+                imported_field.enum = get_enum_from_union_field(field).symbols
+                imported_field.description = field.doc
+
+                if not imported_field.config:
+                    imported_field.config = {}
+                imported_field.config["avroType"] = "enum"
+
         elif field.type.type == "array":
             imported_field.type = "array"
             imported_field.items = import_avro_array_items(field.type)
+            imported_field.description = field.doc
+
+            if not isinstance(field.type.items, avro.schema.PrimitiveSchema):
+                if not imported_field.items.config:
+                    imported_field.items.config = {}
+                imported_field.items.config["avroType"] = field.type.items.name
+
+                if not imported_field.items.config:
+                    imported_field.items.config = {}
+                imported_field.items.config["avroNamespace"] = field.type.items.namespace
+
         elif field.type.type == "map":
             imported_field.type = "map"
             imported_field.values = import_avro_map_values(field.type)
@@ -179,7 +257,7 @@ def import_avro_array_items(array_schema: avro.schema.ArraySchema) -> Field:
         items.__setattr__(prop, array_schema.other_props[prop])
 
     if array_schema.items.type == "record":
-        items.type = "object"
+        items.type = "record"
         items.fields = import_record_fields(array_schema.items.fields)
     elif array_schema.items.type == "array":
         items.type = "array"
@@ -205,7 +283,7 @@ def import_avro_map_values(map_schema: avro.schema.MapSchema) -> Field:
         values.__setattr__(prop, map_schema.other_props[prop])
 
     if map_schema.values.type == "record":
-        values.type = "object"
+        values.type = "record"
         values.fields = import_record_fields(map_schema.values.fields)
     elif map_schema.values.type == "array":
         values.type = "array"
@@ -243,6 +321,22 @@ def import_type_of_optional_field(field: avro.schema.Field) -> str:
         reason="Could not import optional field: union type does not contain a non-null type",
         engine="datacontract",
     )
+
+
+def get_enum_from_union_field(field: avro.schema.Field) -> avro.schema.EnumSchema | None:
+    """
+    Get the enum schema from a union field.
+
+    Args:
+        field: The Avro field with a union type.
+
+    Returns:
+        The enum schema if found, None otherwise.
+    """
+    for field_type in field.type.schemas:
+        if field_type.type == "enum":
+            return field_type
+    return None
 
 
 def get_record_from_union_field(field: avro.schema.Field) -> avro.schema.RecordSchema | None:
@@ -314,7 +408,7 @@ def map_type_from_avro(avro_type_str: str) -> str:
     elif avro_type_str == "map":
         return "map"
     elif avro_type_str == "enum":
-        return "string"
+        return "enum"
     else:
         raise DataContractException(
             type="schema",
